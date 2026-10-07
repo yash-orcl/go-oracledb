@@ -43,6 +43,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"database/sql/driver"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -399,6 +400,33 @@ func TestResourceRetentionLargeResults(t *testing.T) {
 				if _, err = retentionFixtureFingerprint(context.Background(), db, config); err != nil {
 					t.Fatal(err)
 				}
+				// Reuse this fixture fake to prove that the large preflight query,
+				// not just the measured worker, receives its own deadline.
+				originalRequest := c.request
+				config.OperationTimeout = "20ms"
+				c.request = func(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+					if strings.Contains(query, "ROW_NUMBER()") {
+						if _, ok := ctx.Deadline(); !ok {
+							return nil, errors.New("preflight query has no deadline")
+						}
+						<-ctx.Done()
+						return nil, ctx.Err()
+					}
+					return originalRequest(ctx, query, args)
+				}
+				if err = preflightRetentionFixtures(context.Background(), db, config); !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "fixture preflight complex_select") {
+					t.Fatalf("preflight workload deadline lost: %v", err)
+				}
+				c.request = func(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+					<-ctx.Done()
+					return nil, ctx.Err()
+				}
+				if err = preflightRetentionFixtures(context.Background(), db, config); !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("metadata deadline lost: %v", err)
+				}
+				if _, err = retentionFixtureFingerprint(context.Background(), db, config, 20*time.Millisecond); !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("fingerprint deadline lost: %v", err)
+				}
 			}
 			if err = db.Close(); err != nil {
 				t.Fatal(err)
@@ -686,6 +714,182 @@ func TestResourceRetentionEpochsAndArtifacts(t *testing.T) {
 }
 
 type retentionBrokenWriter struct{}
+
+func TestResourceRetentionSetupDiagnostics(t *testing.T) {
+	t.Run("setup deadline records failure and cleans up", func(t *testing.T) {
+		config := oracleTest.ResourceRetentionConfig{Workers: 1, TotalOperations: 1, MaxOpenConnections: 1, Timeout: "5s", OperationTimeout: "10ms", SampleInterval: "1ms", OutputDirectory: t.TempDir()}
+		fake := &retentionFakeConnector{}
+		fake.query = func(ctx context.Context, _ int64) (driver.Rows, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+		result, err := executeExpandedResourceRetention(config, "failed-setup", nil, func(context.Context) (*sql.DB, error) { return sql.OpenDB(fake), nil })
+		if !errors.Is(err, context.DeadlineExceeded) || result.Completed != 0 || fake.closed.Load() != fake.opened.Load() {
+			t.Fatalf("setup deadline/cleanup: result=%+v err=%v", result, err)
+		}
+		data, err := os.ReadFile(result.Artifact)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, expected := range []string{`"stage":"pool_priming"`, `"phase":"stage_end"`, `"status":"failed"`, `"pool_closed":true`} {
+			if !strings.Contains(string(data), expected) {
+				t.Fatalf("missing setup failure evidence: %s", expected)
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+		after, err := os.ReadFile(result.Artifact)
+		if err != nil || string(after) != string(data) {
+			t.Fatal("sampler still writing after setup failure")
+		}
+	})
+	t.Run("stage failures, redaction and reporting", func(t *testing.T) {
+		var output strings.Builder
+		config := &TestConfig{}
+		config.Credentials.Password = "unit-secret"
+		r := &retentionRecorder{writer: &output, runID: "stage-test", started: time.Now(), testConfig: config}
+		cause := errors.New("unit-secret query failure")
+		err := r.runStage(context.Background(), "fixture_workload_lob_select", nil, &retentionProgress{}, func(context.Context) error { return cause })
+		if !errors.Is(err, cause) || !strings.Contains(err.Error(), "fixture_workload_lob_select") {
+			t.Fatalf("lost stage/cause: %v", err)
+		}
+		for _, expected := range []string{`"phase":"stage_start"`, `"phase":"stage_end"`, `"status":"failed"`, `"pool_available":false`, "[redacted]"} {
+			if !strings.Contains(output.String(), expected) {
+				t.Fatalf("missing %s", expected)
+			}
+		}
+		if strings.Contains(output.String(), "unit-secret") {
+			t.Fatal("stage evidence contains password")
+		}
+		r.writer = retentionBrokenWriter{}
+		called := false
+		if err := r.runStage(context.Background(), "setup", nil, &retentionProgress{}, func(context.Context) error { called = true; return nil }); err == nil || called {
+			t.Fatal("reporting failure admitted database work")
+		}
+	})
+	t.Run("priming deadline and parent deadline", func(t *testing.T) {
+		fake := &retentionFakeConnector{}
+		fake.query = func(ctx context.Context, _ int64) (driver.Rows, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+		db := sql.OpenDB(fake)
+		defer db.Close()
+		if err := primeResourceRetentionPool(context.Background(), db, 1, 10*time.Millisecond); !errors.Is(err, context.DeadlineExceeded) || db.Stats().InUse != 0 {
+			t.Fatalf("unbounded priming or retained checkout: %v", err)
+		}
+		parent, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		child, done := retentionOperationContext(parent, time.Hour)
+		defer done()
+		parentDeadline, _ := parent.Deadline()
+		childDeadline, _ := child.Deadline()
+		if !childDeadline.Equal(parentDeadline) {
+			t.Fatal("operation extended overall deadline")
+		}
+	})
+	t.Run("sampling starts in setup and joins before pool close", func(t *testing.T) {
+		config := oracleTest.ResourceRetentionConfig{Workers: 1, TotalOperations: 2, MaxOpenConnections: 1, Timeout: "5s", OperationTimeout: "3s", SampleInterval: "2ms", OutputDirectory: t.TempDir()}
+		artifact := filepath.Join(config.OutputDirectory, "early-test", "samples.jsonl")
+		release := make(chan struct{})
+		defer func() {
+			select {
+			case <-release:
+			default:
+				close(release)
+			}
+		}()
+		fake := &retentionFakeConnector{}
+		fake.query = func(ctx context.Context, number int64) (driver.Rows, error) {
+			if number == 1 {
+				select {
+				case <-release:
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			}
+			return &retentionFakeRows{values: []driver.Value{int64(1)}, closed: &fake.rowsClosed}, nil
+		}
+		type outcome struct {
+			result resourceRetentionResult
+			err    error
+		}
+		finished := make(chan outcome, 1)
+		go func() {
+			result, err := executeExpandedResourceRetention(config, "early-test", nil, func(context.Context) (*sql.DB, error) { return sql.OpenDB(fake), nil })
+			finished <- outcome{result, err}
+		}()
+		// Observe an in-use checkout in a periodic sample while QueryContext is
+		// deliberately blocked. Boundary snapshots alone cannot satisfy this.
+		found := false
+		deadline := time.Now().Add(2 * time.Second)
+		for !found && time.Now().Before(deadline) {
+			data, _ := os.ReadFile(artifact)
+			for _, line := range strings.Split(string(data), "\n") {
+				var sample retentionSample
+				if json.Unmarshal([]byte(line), &sample) == nil && sample.Phase == "natural" && sample.Stage == "pool_priming" && sample.Pool.InUse == 1 {
+					found = true
+					if sample.Counts.Cycles != 0 {
+						t.Error("setup inflated measured count")
+					}
+				}
+			}
+			if !found {
+				time.Sleep(time.Millisecond)
+			}
+		}
+		close(release)
+		run := <-finished
+		if !found || run.err != nil || run.result.Completed != 2 || fake.closed.Load() != fake.opened.Load() {
+			t.Fatalf("early sampling=%v result=%+v err=%v", found, run.result, run.err)
+		}
+		data, err := os.ReadFile(artifact)
+		if err != nil {
+			t.Fatal(err)
+		}
+		decoder := json.NewDecoder(strings.NewReader(string(data)))
+		var stages []string
+		active := ""
+		poolClosed := false
+		for {
+			var record struct {
+				Phase, Stage, Status string
+				PoolAvailable        bool `json:"pool_available"`
+			}
+			if err := decoder.Decode(&record); err == io.EOF {
+				break
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			if record.Phase == "stage_start" {
+				if active != "" {
+					t.Fatalf("overlapping stages: %s/%s", active, record.Stage)
+				}
+				active = record.Stage
+				stages = append(stages, record.Stage)
+			}
+			if record.Phase == "stage_end" {
+				if active != record.Stage || record.Status != "complete" {
+					t.Fatalf("unmatched/failed stage: %+v", record)
+				}
+				active = ""
+				poolClosed = record.Stage == "database_cleanup"
+			}
+			if poolClosed && record.PoolAvailable {
+				t.Fatal("sampled closed pool")
+			}
+		}
+		want := "database_initialization,pool_priming,initial_fixture_fingerprint,warm_up,baseline_checkpoint,measured_workload,final_fixture_verification,final_checkpoint,database_cleanup"
+		if active != "" || strings.Join(stages, ",") != want {
+			t.Fatalf("stage order: %v", stages)
+		}
+		// Once the runner returns there must be no collector left writing.
+		time.Sleep(10 * time.Millisecond)
+		after, err := os.ReadFile(artifact)
+		if err != nil || string(after) != string(data) {
+			t.Fatal("artifact changed after runner returned")
+		}
+	})
+}
 
 func (retentionBrokenWriter) Write([]byte) (int, error) {
 	return 0, errors.New("artifact disk failure")
