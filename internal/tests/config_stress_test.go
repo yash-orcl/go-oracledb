@@ -13,11 +13,83 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func retentionConfigForTest() ResourceRetentionConfig {
 	limit := int64(256)
 	return ResourceRetentionConfig{Workers: 4, TotalOperations: 1024, MaxOpenConnections: 4, Timeout: "10m", MemoryLimitMiB: &limit}
+}
+
+func TestResourceRetentionExpandedConfig(t *testing.T) {
+	base := retentionConfigForTest()
+	base.Workload = "mixed"
+	cases := []struct {
+		name string
+		edit func(*ResourceRetentionConfig)
+		want string
+	}{
+		{"defaults", func(*ResourceRetentionConfig) {}, ""},
+		{"unknown", func(c *ResourceRetentionConfig) { c.Workload = "anything" }, "workload"},
+		{"small result", func(c *ResourceRetentionConfig) { c.RowsPerQuery = 299 }, "rows_per_query"},
+		{"large result", func(c *ResourceRetentionConfig) { c.RowsPerQuery = 513 }, "rows_per_query"},
+		{"schema injection", func(c *ResourceRetentionConfig) { c.FixtureSchema = "SCOTT; DROP TABLE X" }, "fixture_schema"},
+		{"quoted schema", func(c *ResourceRetentionConfig) { c.FixtureSchema = `"SCOTT"` }, "fixture_schema"},
+		{"valid schema", func(c *ResourceRetentionConfig) { c.FixtureSchema = "STRESS_DATA" }, ""},
+		{"bad operation timeout", func(c *ResourceRetentionConfig) { c.OperationTimeout = "0s" }, "operation_timeout"},
+		{"bad sampling", func(c *ResourceRetentionConfig) { c.SampleInterval = "-1s" }, "sample_interval"},
+		{"bad checkpoint", func(c *ResourceRetentionConfig) { c.CheckpointInterval = "no" }, "checkpoint_interval"},
+		{"two modes", func(c *ResourceRetentionConfig) { c.Duration = "1h" }, "mutually exclusive"},
+		{"duration negative", func(c *ResourceRetentionConfig) { c.TotalOperations = 0; c.Duration = "-1h" }, "duration"},
+		{"duration headroom", func(c *ResourceRetentionConfig) { c.TotalOperations = 0; c.Duration = "24h"; c.Timeout = "24h30m" }, "timeout"},
+		{"duration valid", func(c *ResourceRetentionConfig) { c.TotalOperations = 0; c.Duration = "24h"; c.Timeout = "26h" }, ""},
+		{"duration overflow safe", func(c *ResourceRetentionConfig) {
+			c.TotalOperations = 0
+			c.Duration = (time.Duration(math.MaxInt64)).String()
+			c.Timeout = "1h"
+		}, "timeout"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := base
+			tc.edit(&c)
+			err := c.Validate()
+			if tc.want == "" {
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("got %v want %s", err, tc.want)
+			}
+		})
+	}
+	n := base.Normalized()
+	if n.RowsPerQuery != 300 || n.OperationTimeout != "30m" || n.SampleInterval != "60s" || n.CheckpointInterval != "1h" || n.OutputDirectory != "stress-results" || base.RowsPerQuery != 0 {
+		t.Fatal("incorrect/non-copying defaults")
+	}
+	base.FixtureSchema = "STRESS_DATA"
+	base.Duration = "24h"
+	base.TotalOperations = 0
+	base.Timeout = "26h"
+	base.DiagnosticProfiles = true
+	input := &TestConfig{Stress: &StressConfig{ResourceRetention: &base}}
+	clone := input.Clone()
+	dest := &TestConfig{}
+	dest.MergeWith(input)
+	if !reflect.DeepEqual(input.Stress, clone.Stress) || !reflect.DeepEqual(input.Stress, dest.Stress) {
+		t.Fatal("expanded settings lost during clone/merge")
+	}
+	data, err := json.Marshal(input.Stress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded StressConfig
+	if err = json.Unmarshal(data, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(&decoded, input.Stress) {
+		t.Fatal("expanded JSON roundtrip")
+	}
 }
 
 func TestResourceRetentionConfigValidation(t *testing.T) {
@@ -182,6 +254,45 @@ func TestResourceRetentionConfigCloneAndMerge(t *testing.T) {
 	}
 }
 
+func TestConnectionLifecycleDefaultsAndDurationJSON(t *testing.T) {
+	base := ConnectionLifecycleConfig{Workers: 16, Duration: "48h", Timeout: "50h"}
+	normal := base.Normalized()
+	if normal.OperationTimeout != "2m" || normal.SampleInterval != "1m" || normal.OutputDirectory != "stress-results" || !normal.ProfilesEnabled() {
+		t.Fatalf("incorrect defaults: %+v", normal)
+	}
+	if base.OperationTimeout != "" || base.OutputDirectory != "" {
+		t.Fatal("normalization modified source")
+	}
+	path := filepath.Join(t.TempDir(), "config.json")
+	data := []byte(`[{"config_name":"soak","enabled":true,"stress":{"connection_lifecycle":{"workers":16,"duration":"48h","timeout":"50h","diagnostic_profiles":false}}}]`)
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	env, err := NewTestingEnvironment(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := env.GetConfig("soak")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Stress.ConnectionLifecycle.ProfilesEnabled() || loaded.Stress.ConnectionLifecycle.Duration != "48h" {
+		t.Fatal("duration or explicit false not preserved")
+	}
+	clone := loaded.Clone()
+	*clone.Stress.ConnectionLifecycle.DiagnosticProfiles = true
+	if loaded.Stress.ConnectionLifecycle.ProfilesEnabled() {
+		t.Fatal("profile clone aliases source")
+	}
+	retention := retentionConfigForTest()
+	destination := &TestConfig{Stress: &StressConfig{ResourceRetention: &retention}}
+	destination.MergeWith(loaded)
+	*destination.Stress.ConnectionLifecycle.DiagnosticProfiles = true
+	if loaded.Stress.ConnectionLifecycle.ProfilesEnabled() || destination.Stress.ResourceRetention == nil {
+		t.Fatal("merge aliases profile or discards retention")
+	}
+}
+
 func TestConnectionLifecycleConfigValidation(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -194,6 +305,16 @@ func TestConnectionLifecycleConfigValidation(t *testing.T) {
 		{"invalid timeout", ConnectionLifecycleConfig{Workers: 4, CyclesPerWorker: 64, Timeout: "ten minutes"}, "timeout"},
 		{"zero timeout", ConnectionLifecycleConfig{Workers: 4, CyclesPerWorker: 64, Timeout: "0s"}, "timeout"},
 		{"overflow", ConnectionLifecycleConfig{Workers: int(^uint(0) >> 1), CyclesPerWorker: 2, Timeout: "10m"}, "overflows"},
+		{"duration valid", ConnectionLifecycleConfig{Workers: 16, Duration: "24h", Timeout: "26h"}, ""},
+		{"duration and count", ConnectionLifecycleConfig{Workers: 16, CyclesPerWorker: 1, Duration: "24h", Timeout: "26h"}, "mutually exclusive"},
+		{"negative duration", ConnectionLifecycleConfig{Workers: 16, Duration: "-1h", Timeout: "26h"}, "duration"},
+		{"bad duration", ConnectionLifecycleConfig{Workers: 16, Duration: "later", Timeout: "26h"}, "duration"},
+		{"short safety deadline", ConnectionLifecycleConfig{Workers: 16, Duration: "24h", Timeout: "24h16m"}, "timeout"},
+		{"exact safety margin", ConnectionLifecycleConfig{Workers: 16, Duration: "24h", Timeout: "24h17m"}, "timeout"},
+		{"duration overflow", ConnectionLifecycleConfig{Workers: 16, Duration: (time.Duration(math.MaxInt64)).String(), Timeout: "1h"}, "timeout"},
+		{"operation deadline", ConnectionLifecycleConfig{Workers: 1, CyclesPerWorker: 1, Timeout: "10m", OperationTimeout: "0s"}, "operation_timeout"},
+		{"sample interval", ConnectionLifecycleConfig{Workers: 1, CyclesPerWorker: 1, Timeout: "10m", SampleInterval: "-1s"}, "sample_interval"},
+		{"blank output", ConnectionLifecycleConfig{Workers: 1, CyclesPerWorker: 1, Timeout: "10m", OutputDirectory: " "}, "output_directory"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
