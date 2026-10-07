@@ -117,7 +117,7 @@ func executeResourceRetention(config oracleTest.ResourceRetentionConfig, openDB 
 	return executeExpandedResourceRetention(config, newRetentionRunID(), nil, openDB)
 }
 
-func primeResourceRetentionPool(ctx context.Context, db *sql.DB, count int) (err error) {
+func primeResourceRetentionPool(ctx context.Context, db *sql.DB, count int, operationTimeout ...time.Duration) (err error) {
 	connections := make([]*sql.Conn, 0, count)
 	defer func() {
 		for index, conn := range connections {
@@ -129,16 +129,32 @@ func primeResourceRetentionPool(ctx context.Context, db *sql.DB, count int) (err
 	// Hold all checkouts until all have been acquired. Returning each connection
 	// immediately could prime the same physical connection repeatedly.
 	for index := 0; index < count; index++ {
-		conn, err := db.Conn(ctx)
-		if err != nil {
-			return fmt.Errorf("acquire warm-up connection %d: %w", index+1, err)
-		}
-		connections = append(connections, conn)
-		if err := executeSelectDual(ctx, conn); err != nil {
-			return fmt.Errorf("query warm-up connection %d: %w", index+1, err)
+		if err := func() error {
+			opCtx, cancel := retentionOperationContext(ctx, operationTimeout...)
+			defer cancel()
+			conn, err := db.Conn(opCtx)
+			if err != nil {
+				return fmt.Errorf("acquire warm-up connection %d: %w", index+1, err)
+			}
+			connections = append(connections, conn)
+			if err := executeSelectDual(opCtx, conn); err != nil {
+				return fmt.Errorf("query warm-up connection %d: %w", index+1, err)
+			}
+			return opCtx.Err()
+		}(); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+// Each setup operation gets its own budget, bounded by the overall deadline.
+// Omitted budgets preserve existing functional-helper callers' parent context.
+func retentionOperationContext(ctx context.Context, timeout ...time.Duration) (context.Context, context.CancelFunc) {
+	if len(timeout) != 0 {
+		return context.WithTimeout(ctx, timeout[0])
+	}
+	return context.WithCancel(ctx)
 }
 
 func resourceRetentionWorkerOperations(total, workers, worker int) int {
@@ -643,8 +659,27 @@ func retentionWorkloadKinds(workload string) []string {
 }
 
 func preflightRetentionFixtures(ctx context.Context, db *sql.DB, config oracleTest.ResourceRetentionConfig) error {
+	return preflightRetentionFixturesObserved(ctx, db, config, nil)
+}
+
+// The optional observer adds stage evidence for stress execution only. Shared
+// functional validation keeps the same queries, data checks and ownership.
+func preflightRetentionFixturesObserved(ctx context.Context, db *sql.DB, config oracleTest.ResourceRetentionConfig, observe func(string, func(context.Context) error) error) error {
 	if config.Workload == "select_dual" {
 		return nil
+	}
+	operationTimeout, _ := time.ParseDuration(config.Normalized().OperationTimeout)
+	operation := func(name string, fn func(context.Context) error) error {
+		bounded := func(parent context.Context) error {
+			opCtx, cancel := retentionOperationContext(parent, operationTimeout)
+			defer cancel()
+			err := fn(opCtx)
+			return errors.Join(err, opCtx.Err())
+		}
+		if observe != nil {
+			return observe(name, bounded)
+		}
+		return bounded(ctx)
 	}
 	// Metadata checks distinguish native JSON from a CLOB/text substitute.
 	required := map[string]map[string]string{
@@ -660,35 +695,42 @@ func preflightRetentionFixtures(ctx context.Context, db *sql.DB, config oracleTe
 		}
 	}
 	for table, columns := range required {
-		rows, err := db.QueryContext(ctx, `SELECT column_name, data_type FROM all_tab_columns WHERE owner=COALESCE(:owner, SYS_CONTEXT('USERENV','CURRENT_SCHEMA')) AND table_name=:table_name`, sql.Named("owner", strings.ToUpper(config.FixtureSchema)), sql.Named("table_name", table))
-		if err != nil {
-			return fmt.Errorf("fixture metadata %s: %w", table, err)
-		}
-		var readErr error
-		for rows.Next() {
-			var name, kind string
-			if e := rows.Scan(&name, &kind); e != nil {
-				readErr = e
-				break
+		if err := operation("fixture_metadata_"+table, func(opCtx context.Context) error {
+			rows, err := db.QueryContext(opCtx, `SELECT column_name, data_type FROM all_tab_columns WHERE owner=COALESCE(:owner, SYS_CONTEXT('USERENV','CURRENT_SCHEMA')) AND table_name=:table_name`, sql.Named("owner", strings.ToUpper(config.FixtureSchema)), sql.Named("table_name", table))
+			if err != nil {
+				return fmt.Errorf("fixture metadata %s: %w", table, err)
 			}
-			if expected, ok := columns[name]; ok {
-				if kind != expected {
-					readErr = fmt.Errorf("%s.%s has type %s, want %s", table, name, kind, expected)
+			var readErr error
+			for rows.Next() {
+				var name, kind string
+				if e := rows.Scan(&name, &kind); e != nil {
+					readErr = e
 					break
 				}
-				delete(columns, name)
+				if expected, ok := columns[name]; ok {
+					if kind != expected {
+						readErr = fmt.Errorf("%s.%s has type %s, want %s", table, name, kind, expected)
+						break
+					}
+					delete(columns, name)
+				}
 			}
-		}
-		readErr = errors.Join(readErr, rows.Err(), retentionCleanup("metadata rows", rows.Close()))
-		if readErr != nil {
-			return readErr
-		}
-		if len(columns) > 0 {
-			return fmt.Errorf("missing fixture columns in %s: %v", table, columns)
+			readErr = errors.Join(readErr, rows.Err(), retentionCleanup("metadata rows", rows.Close()))
+			if readErr != nil {
+				return readErr
+			}
+			if len(columns) > 0 {
+				return fmt.Errorf("missing fixture columns in %s: %v", table, columns)
+			}
+			return nil
+		}); err != nil {
+			return err
 		}
 	}
 	var count, minID, maxID, minVersion, maxVersion int
-	err := db.QueryRowContext(ctx, "SELECT COUNT(*), MIN(id), MAX(id), MIN(fixture_version), MAX(fixture_version) FROM "+retentionTable(config, "ORA_STRESS_CORE")).Scan(&count, &minID, &maxID, &minVersion, &maxVersion)
+	err := operation("fixture_identity", func(opCtx context.Context) error {
+		return db.QueryRowContext(opCtx, "SELECT COUNT(*), MIN(id), MAX(id), MIN(fixture_version), MAX(fixture_version) FROM "+retentionTable(config, "ORA_STRESS_CORE")).Scan(&count, &minID, &maxID, &minVersion, &maxVersion)
+	})
 	if err != nil {
 		return fmt.Errorf("fixture identity: %w", err)
 	}
@@ -698,7 +740,10 @@ func preflightRetentionFixtures(ctx context.Context, db *sql.DB, config oracleTe
 	for _, kind := range retentionWorkloadKinds(config.Workload) {
 		c := config
 		c.Workload = kind
-		if _, err := executeRetentionCycle(ctx, db, c, 0, 0); err != nil {
+		if err := operation("fixture_workload_"+kind, func(opCtx context.Context) error {
+			_, err := executeRetentionCycle(opCtx, db, c, 0, 0)
+			return err
+		}); err != nil {
 			return fmt.Errorf("fixture preflight %s: %w", kind, err)
 		}
 	}
@@ -963,11 +1008,14 @@ type retentionSample struct {
 	Timestamp       time.Time        `json:"timestamp_utc"`
 	ElapsedNS       int64            `json:"elapsed_ns"`
 	Phase           string           `json:"phase"`
+	Stage           string           `json:"stage,omitempty"`
+	StageStatus     string           `json:"stage_status,omitempty"`
 	Checkpoint      int              `json:"checkpoint"`
 	Counts          retentionCounts  `json:"completed"`
 	Memory          runtime.MemStats `json:"runtime_memstats"`
 	Goroutines      int              `json:"goroutines"`
 	Pool            sql.DBStats      `json:"pool"`
+	PoolAvailable   bool             `json:"pool_available"`
 	AllocationDelta uint64           `json:"total_alloc_delta"`
 	MallocDelta     uint64           `json:"mallocs_delta"`
 	FreeDelta       uint64           `json:"frees_delta"`
@@ -984,6 +1032,59 @@ type retentionRecorder struct {
 	started      time.Time
 	previousHeap resourceRetentionHeap
 	growthStreak int
+	stage        string
+	stageStatus  string
+	testConfig   *TestConfig
+}
+
+// Stage events are bounded setup/epoch diagnostics, never per-row histories.
+// Natural boundary samples do not force GC or change measured completion counts.
+func (r *retentionRecorder) runStage(ctx context.Context, name string, db *sql.DB, p *retentionProgress, operation func(context.Context) error) (err error) {
+	began := time.Now()
+	r.Lock()
+	r.stage, r.stageStatus = name, "running"
+	err = r.writeStageLocked("stage_start", name, began, nil)
+	if err == nil {
+		_, err = r.sampleLocked("natural", -1, db, p)
+	}
+	r.Unlock()
+	if err != nil {
+		return fmt.Errorf("stage %s reporting: %w", name, err)
+	}
+	finished := false
+	defer func() {
+		r.Lock()
+		defer r.Unlock()
+		r.stageStatus = "complete"
+		if err != nil || !finished {
+			r.stageStatus = "failed"
+		}
+		reportedErr := err
+		if !finished {
+			reportedErr = errors.New("stage interrupted before returning")
+		}
+		err = errors.Join(err, r.writeStageLocked("stage_end", name, began, reportedErr))
+		_, sampleErr := r.sampleLocked("natural", -1, db, p)
+		err = errors.Join(err, sampleErr)
+	}()
+	err = operation(ctx)
+	finished = true
+	if err == nil {
+		err = ctx.Err()
+	}
+	if err != nil {
+		err = fmt.Errorf("stage %s: %w", name, err)
+	}
+	return
+}
+
+func (r *retentionRecorder) writeStageLocked(phase, name string, began time.Time, err error) error {
+	return json.NewEncoder(r.writer).Encode(map[string]any{
+		"phase": phase, "stage": name, "status": r.stageStatus,
+		"run_id": r.runID, "pid": os.Getpid(), "timestamp_utc": time.Now().UTC(),
+		"elapsed_ns": time.Since(r.started).Nanoseconds(), "stage_duration_ns": time.Since(began).Nanoseconds(),
+		"error": redactRetentionText(safeRetentionError(err), r.testConfig),
+	})
 }
 
 func (r *retentionRecorder) event(v any) error {
@@ -999,7 +1100,10 @@ func (r *retentionRecorder) sample(phase string, index int, db *sql.DB, p *reten
 func (r *retentionRecorder) sampleLocked(phase string, index int, db *sql.DB, p *retentionProgress) (resourceRetentionHeap, error) {
 	var mem runtime.MemStats
 	runtime.ReadMemStats(&mem)
-	s := retentionSample{RunID: r.runID, PID: os.Getpid(), Timestamp: time.Now().UTC(), ElapsedNS: time.Since(r.started).Nanoseconds(), Phase: phase, Checkpoint: index, Counts: p.snapshot(), Memory: mem, Goroutines: runtime.NumGoroutine(), Pool: db.Stats()}
+	s := retentionSample{RunID: r.runID, PID: os.Getpid(), Timestamp: time.Now().UTC(), ElapsedNS: time.Since(r.started).Nanoseconds(), Phase: phase, Stage: r.stage, StageStatus: r.stageStatus, Checkpoint: index, Counts: p.snapshot(), Memory: mem, Goroutines: runtime.NumGoroutine(), PoolAvailable: db != nil}
+	if db != nil {
+		s.Pool = db.Stats()
+	}
 	if r.previous.TotalAlloc != 0 {
 		s.AllocationDelta = mem.TotalAlloc - r.previous.TotalAlloc
 		s.MallocDelta = mem.Mallocs - r.previous.Mallocs
@@ -1146,7 +1250,7 @@ func executeExpandedResourceRetention(config oracleTest.ResourceRetentionConfig,
 	if e != nil {
 		return result, e
 	}
-	recorder := &retentionRecorder{writer: f, runID: runID, started: began}
+	recorder := &retentionRecorder{writer: f, runID: runID, started: began, testConfig: testConfig}
 	defer func() { err = errors.Join(err, f.Sync(), f.Close()) }()
 	metadata := map[string]any{
 		"phase": "configuration", "run_id": runID, "pid": os.Getpid(), "run_start_utc": began.UTC(),
@@ -1193,71 +1297,51 @@ func executeExpandedResourceRetention(config oracleTest.ResourceRetentionConfig,
 	timeout, _ := time.ParseDuration(config.Timeout)
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	db, e := openDB(ctx)
-	if e != nil {
-		return result, e
+	operationTimeout, _ := time.ParseDuration(config.OperationTimeout)
+	p := &retentionProgress{}
+	var db *sql.DB
+	err = recorder.runStage(ctx, "database_initialization", nil, p, func(parent context.Context) error {
+		opCtx, done := retentionOperationContext(parent, operationTimeout)
+		defer done()
+		var openErr error
+		db, openErr = openDB(opCtx)
+		return errors.Join(openErr, opCtx.Err())
+	})
+	// Even a successful factory can be followed by a reporting/deadline failure.
+	// Install pool cleanup before returning any such error.
+	if db == nil {
+		return result, errors.Join(err, errors.New("database initialization returned no handle"))
 	}
 	defer func() {
+		closeStart := time.Now()
+		recorder.Lock()
+		recorder.stage, recorder.stageStatus = "database_cleanup", "running"
+		err = errors.Join(err, recorder.writeStageLocked("stage_start", "database_cleanup", closeStart, nil))
+		recorder.Unlock()
 		closeErr := db.Close()
 		err = errors.Join(err, retentionCleanup("database", closeErr))
+		recorder.Lock()
+		recorder.stageStatus = "complete"
+		if closeErr != nil {
+			recorder.stageStatus = "failed"
+		}
+		err = errors.Join(err, recorder.writeStageLocked("stage_end", "database_cleanup", closeStart, closeErr))
+		recorder.Unlock()
 		status := "complete"
 		if err != nil {
 			status = "failed"
 		}
 		err = errors.Join(err, recorder.event(map[string]any{"phase": "result", "run_id": runID, "timestamp_utc": time.Now().UTC(), "status": status, "counts": result.Counts, "active_ns": result.Duration.Nanoseconds(), "drain_ns": result.Drain.Nanoseconds(), "checkpoint_pause_ns": result.Pauses.Nanoseconds(), "wall_ns": time.Since(began).Nanoseconds(), "baseline": result.Baseline, "final": result.Final, "pool_closed": closeErr == nil, "error": redactRetentionText(safeRetentionError(err), testConfig), "diagnostic_only": true}))
 	}()
+	if err != nil {
+		return
+	}
 	db.SetMaxOpenConns(config.MaxOpenConnections)
 	db.SetMaxIdleConns(config.MaxOpenConnections)
 	db.SetConnMaxLifetime(0)
 	db.SetConnMaxIdleTime(0)
-	if testConfig != nil {
-		// Configuration versions are sometimes unspecified. Record the live
-		// release/service/PDB using public, read-only identity queries.
-		var version, name, pdb, service string
-		if e := db.QueryRowContext(ctx, `
-	SELECT version_full
-	FROM product_component_version
-	WHERE product LIKE 'Oracle Database%'
-	   OR product LIKE 'Oracle AI Database%'
-`).Scan(&version); e != nil {
-			return result, fmt.Errorf("database version preflight: %w", e)
-		}
-		if e := db.QueryRowContext(ctx, `SELECT SYS_CONTEXT('USERENV','DB_NAME'),SYS_CONTEXT('USERENV','CON_NAME'),SYS_CONTEXT('USERENV','SERVICE_NAME') FROM DUAL`).Scan(&name, &pdb, &service); e != nil {
-			return result, fmt.Errorf("database identity preflight: %w", e)
-		}
-		if e := recorder.event(map[string]any{"phase": "database_identity", "run_id": runID, "database_version": version, "database": name, "pdb": pdb, "service": service}); e != nil {
-			return result, e
-		}
-	}
-	if err = primeResourceRetentionPool(ctx, db, config.MaxOpenConnections); err != nil {
-		return
-	}
-	if err = preflightRetentionFixtures(ctx, db, config); err != nil {
-		return
-	}
-	fingerprint, e := retentionFixtureFingerprint(ctx, db, config)
-	if e != nil {
-		return result, e
-	}
-	// Complete warm-up cycles are additional to measured cycles.
-	_, err = runResourceRetentionWorkers(ctx, config.Workers, config.Workers, func(ctx context.Context, w, i int) error {
-		opTimeout, _ := time.ParseDuration(config.OperationTimeout)
-		opCtx, cancel := context.WithTimeout(ctx, opTimeout)
-		defer cancel()
-		_, e := executeRetentionCycle(opCtx, db, config, w, i)
-		return e
-	})
-	if err != nil {
-		return
-	}
-	p := &retentionProgress{}
-	result.Baseline, err = recorder.checkpoint(0, db, p, config.DiagnosticProfiles, dir)
-	if err != nil {
-		return
-	}
-	if err = recorder.event(map[string]any{"phase": "tls_verified", "run_id": runID, "protocol": "tcps", "fixture_fingerprint": fingerprint}); err != nil {
-		return
-	}
+	// Start before the first database query. The same sampler remains alive at
+	// baseline and final checkpoints, and is joined before pool/file cleanup.
 	samplingCtx, stopSampling := context.WithCancel(ctx)
 	sampled := make(chan struct{})
 	var sampleErr error
@@ -1280,6 +1364,80 @@ func executeExpandedResourceRetention(config oracleTest.ResourceRetentionConfig,
 		}
 	}()
 	defer func() { stopSampling(); <-sampled; err = errors.Join(err, sampleErr) }()
+	stage := func(name string, operation func(context.Context) error) error {
+		return recorder.runStage(ctx, name, db, p, operation)
+	}
+	boundedStage := func(name string, operation func(context.Context) error) error {
+		return stage(name, func(parent context.Context) error {
+			opCtx, done := retentionOperationContext(parent, operationTimeout)
+			defer done()
+			return errors.Join(operation(opCtx), opCtx.Err())
+		})
+	}
+	if testConfig != nil {
+		// Configuration versions are sometimes unspecified. Record the live
+		// release/service/PDB using public, read-only identity queries.
+		var version, name, pdb, service string
+		if e := boundedStage("database_version", func(opCtx context.Context) error {
+			return db.QueryRowContext(opCtx, `
+	SELECT version_full
+	FROM product_component_version
+	WHERE product LIKE 'Oracle Database%'
+	   OR product LIKE 'Oracle AI Database%'
+`).Scan(&version)
+		}); e != nil {
+			return result, fmt.Errorf("database version preflight: %w", e)
+		}
+		if e := boundedStage("database_identity", func(opCtx context.Context) error {
+			return db.QueryRowContext(opCtx, `SELECT SYS_CONTEXT('USERENV','DB_NAME'),SYS_CONTEXT('USERENV','CON_NAME'),SYS_CONTEXT('USERENV','SERVICE_NAME') FROM DUAL`).Scan(&name, &pdb, &service)
+		}); e != nil {
+			return result, fmt.Errorf("database identity preflight: %w", e)
+		}
+		if e := recorder.event(map[string]any{"phase": "database_identity", "run_id": runID, "database_version": version, "database": name, "pdb": pdb, "service": service}); e != nil {
+			return result, e
+		}
+	}
+	if err = stage("pool_priming", func(parent context.Context) error {
+		return primeResourceRetentionPool(parent, db, config.MaxOpenConnections, operationTimeout)
+	}); err != nil {
+		return
+	}
+	if err = preflightRetentionFixturesObserved(ctx, db, config, stage); err != nil {
+		return
+	}
+	var fingerprint string
+	if err = stage("initial_fixture_fingerprint", func(parent context.Context) error {
+		var e error
+		fingerprint, e = retentionFixtureFingerprint(parent, db, config, operationTimeout)
+		return e
+	}); err != nil {
+		return
+	}
+	// Complete warm-up cycles are additional to measured cycles.
+	err = stage("warm_up", func(parent context.Context) error {
+		_, e := runResourceRetentionWorkers(parent, config.Workers, config.Workers, func(ctx context.Context, w, i int) error {
+			opTimeout, _ := time.ParseDuration(config.OperationTimeout)
+			opCtx, cancel := context.WithTimeout(ctx, opTimeout)
+			defer cancel()
+			_, e := executeRetentionCycle(opCtx, db, config, w, i)
+			return e
+		})
+		return e
+	})
+	if err != nil {
+		return
+	}
+	err = stage("baseline_checkpoint", func(context.Context) error {
+		var e error
+		result.Baseline, e = recorder.checkpoint(0, db, p, config.DiagnosticProfiles, dir)
+		return e
+	})
+	if err != nil {
+		return
+	}
+	if err = recorder.event(map[string]any{"phase": "tls_verified", "run_id": runID, "protocol": "tcps", "fixture_fingerprint": fingerprint}); err != nil {
+		return
+	}
 	indices := make([]int, config.Workers)
 	checkpointEvery, _ := time.ParseDuration(config.CheckpointInterval)
 	duration, _ := time.ParseDuration(config.Duration)
@@ -1289,8 +1447,13 @@ func executeExpandedResourceRetention(config oracleTest.ResourceRetentionConfig,
 		if duration > 0 {
 			span = min(span, duration-result.Duration)
 		}
-		elapsed, drain, e := runRetentionEpoch(ctx, config, indices, span, p, func(ctx context.Context, w, i int) (retentionCounts, error) {
-			return executeRetentionCycle(ctx, db, config, w, i)
+		var elapsed, drain time.Duration
+		e := stage("measured_workload", func(parent context.Context) error {
+			var epochErr error
+			elapsed, drain, epochErr = runRetentionEpoch(parent, config, indices, span, p, func(ctx context.Context, w, i int) (retentionCounts, error) {
+				return executeRetentionCycle(ctx, db, config, w, i)
+			})
+			return epochErr
 		})
 		result.Duration += elapsed
 		result.Drain += drain
@@ -1305,22 +1468,31 @@ func executeExpandedResourceRetention(config oracleTest.ResourceRetentionConfig,
 			break
 		}
 		pauseStart := time.Now()
-		_, err = recorder.checkpoint(checkpoint, db, p, config.DiagnosticProfiles, dir)
+		err = stage("drained_checkpoint", func(context.Context) error {
+			_, e := recorder.checkpoint(checkpoint, db, p, config.DiagnosticProfiles, dir)
+			return e
+		})
 		result.Pauses += time.Since(pauseStart)
 		checkpoint++
 		if err != nil {
 			break
 		}
 	}
-	stopSampling()
-	<-sampled
-	err = errors.Join(err, sampleErr)
-	finalFingerprint, e := retentionFixtureFingerprint(ctx, db, config)
+	var finalFingerprint string
+	e = stage("final_fixture_verification", func(parent context.Context) error {
+		var fingerprintErr error
+		finalFingerprint, fingerprintErr = retentionFixtureFingerprint(parent, db, config, operationTimeout)
+		return fingerprintErr
+	})
 	err = errors.Join(err, e)
 	if e == nil && finalFingerprint != fingerprint {
 		err = errors.Join(err, errors.New("fixture changed during run"))
 	}
-	result.Final, e = recorder.checkpoint(checkpoint, db, p, config.DiagnosticProfiles, dir)
+	e = stage("final_checkpoint", func(context.Context) error {
+		var checkpointErr error
+		result.Final, checkpointErr = recorder.checkpoint(checkpoint, db, p, config.DiagnosticProfiles, dir)
+		return checkpointErr
+	})
 	err = errors.Join(err, e, ctx.Err())
 	if config.DiagnosticProfiles {
 		err = errors.Join(err, writeRetentionProfile(filepath.Join(dir, "goroutines.txt"), "goroutine", 2))
@@ -1349,7 +1521,7 @@ func redactRetentionText(value string, config *TestConfig) string {
 
 // ROWSCN/count is a change guard, not a cryptographic audit. DBA freeze and
 // SELECT-only fixture privileges remain prerequisites for repeatability.
-func retentionFixtureFingerprint(ctx context.Context, db *sql.DB, config oracleTest.ResourceRetentionConfig) (string, error) {
+func retentionFixtureFingerprint(ctx context.Context, db *sql.DB, config oracleTest.ResourceRetentionConfig, operationTimeout ...time.Duration) (string, error) {
 	if config.Workload == "select_dual" {
 		return "smoke-no-fixtures", nil
 	}
@@ -1373,7 +1545,12 @@ func retentionFixtureFingerprint(ctx context.Context, db *sql.DB, config oracleT
 			idColumn = "group_id"
 			expected = 8
 		}
-		if err := db.QueryRowContext(ctx, "SELECT COUNT(*), COALESCE(MAX(ORA_ROWSCN),0),MIN("+idColumn+"),MAX("+idColumn+"),COUNT(DISTINCT "+idColumn+") FROM "+retentionTable(config, table)).Scan(&count, &scn, &minID, &maxID, &distinctID); err != nil {
+		err := func() error {
+			opCtx, cancel := retentionOperationContext(ctx, operationTimeout...)
+			defer cancel()
+			return errors.Join(db.QueryRowContext(opCtx, "SELECT COUNT(*), COALESCE(MAX(ORA_ROWSCN),0),MIN("+idColumn+"),MAX("+idColumn+"),COUNT(DISTINCT "+idColumn+") FROM "+retentionTable(config, table)).Scan(&count, &scn, &minID, &maxID, &distinctID), opCtx.Err())
+		}()
+		if err != nil {
 			return "", err
 		}
 		if count != expected || distinctID != expected || minID != 1 || maxID != expected {
