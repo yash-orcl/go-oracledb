@@ -2,3 +2,5 @@
 .oca
 coverage/
 test-config.json
+test-config-tcps.json
+stress-results/
