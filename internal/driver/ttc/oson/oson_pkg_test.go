@@ -114,6 +114,13 @@ var testCases = []oracleTest.CategorizedTestCase{
 	// Keep unsupported inputs and documents beyond the format limit out of output.
 	{Name: "TestEncodeRejectsUnsupportedValues", Categories: "unitary", Fn: TestEncodeRejectsUnsupportedValues},
 	{Name: "TestEncodeRejectsOversizedDocument", Categories: "unitary", Fn: TestEncodeRejectsOversizedDocument},
+	{Name: "TestOSONScalarBoundaryContent", Categories: "unitary", Exclusive: true, Fn: TestOSONScalarBoundaryContent},
+	{Name: "TestOSONContainerBoundaryContent", Categories: "unitary", Exclusive: true, Fn: TestOSONContainerBoundaryContent},
+	{Name: "TestOSONDictionaryHeapBoundaryContent", Categories: "unitary", Exclusive: true, Fn: TestOSONDictionaryHeapBoundaryContent},
+	{Name: "TestOSONMixedDictionaryFieldIDBoundary", Categories: "unitary", Exclusive: true, Fn: TestOSONMixedDictionaryFieldIDBoundary},
+	{Name: "TestOSONFieldNameMaximum", Categories: "unitary", Exclusive: true, Fn: TestOSONFieldNameMaximum},
+	{Name: "TestOSONExactDocumentSizeLimit", Categories: "unitary", Exclusive: true, Fn: TestOSONExactDocumentSizeLimit},
+	{Name: "TestOSONNumberTextLengthLimit", Categories: "unitary", Exclusive: true, Fn: TestOSONNumberTextLengthLimit},
 }
 
 // main test
