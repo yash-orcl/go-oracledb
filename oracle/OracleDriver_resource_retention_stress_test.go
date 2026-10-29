@@ -2,8 +2,39 @@
 ** Copyright (c) 2026 Oracle and/or its affiliates.
 **
 ** The Universal Permissive License (UPL), Version 1.0
+**
+** Subject to the condition set forth below, permission is hereby granted to any
+** person obtaining a copy of this software, associated documentation and/or data
+** (collectively the "Software"), free of charge and under any and all copyright
+** rights in the Software, and any and all patent rights owned or freely
+** licensable by each licensor hereunder covering either (i) the unmodified
+** Software as contributed to or provided by such licensor, or (ii) the Larger
+** Works (as defined below), to deal in both
+**
+** (a) the Software, and
+** (b) any piece of software and/or hardware listed in the lrgrwrks.txt file if
+** one is included with the Software (each a "Larger Work" to which the Software
+** is contributed by such licensors),
+**
+** without restriction, including without limitation the rights to copy, create
+** derivative works of, display, perform, and distribute the Software and make,
+** use, sell, offer for sale, import, export, have made, and have sold the
+** Software and the Larger Work(s), and to sublicense the foregoing rights on
+** either these or other terms.
+**
+** This license is subject to the following condition:
+** The above copyright notice and either this complete permission notice or at
+** a minimum a reference to the UPL must be included in all copies or
+** substantial portions of the Software.
+**
+** THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+** IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+** FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+** AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+** LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+** OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+** SOFTWARE.
  */
-
 package oracle
 
 import (
@@ -20,7 +51,6 @@ import (
 	"io"
 	"math/big"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
@@ -41,16 +71,18 @@ type resourceRetentionHeap struct {
 }
 
 type resourceRetentionResult struct {
-	Completed        int
-	Duration         time.Duration
-	Baseline         resourceRetentionHeap
-	Final            resourceRetentionHeap
-	MemoryLimitBytes int64
-	Counts           retentionCounts
-	Drain            time.Duration
-	Pauses           time.Duration
-	Wall             time.Duration
-	Artifact         string
+	Completed                  int
+	Duration                   time.Duration
+	Baseline                   resourceRetentionHeap
+	Final                      resourceRetentionHeap
+	MemoryLimitBytes           int64
+	Counts                     retentionCounts
+	Drain                      time.Duration
+	Pauses                     time.Duration
+	Wall                       time.Duration
+	Artifact                   string
+	BaselineCheckpointComplete bool
+	FinalCheckpointComplete    bool
 }
 
 func TestDriver_ResourceRetentionMemoryLeakStress(t *testing.T) {
@@ -90,15 +122,19 @@ func TestDriver_ResourceRetentionMemoryLeakStress(t *testing.T) {
 	if config.MemoryLimitMiB != nil {
 		target = fmt.Sprint(*config.MemoryLimitMiB)
 	}
-	t.Logf("configuration: workers=%d total_operations=%d max_open_connections=%d timeout=%s soft_go_memory_target_mib=%s effective_go_memory_limit_bytes=%d go=%s",
-		config.Workers, config.TotalOperations, config.MaxOpenConnections, config.Timeout, target, result.MemoryLimitBytes, runtime.Version())
-	t.Logf("result: requested=%d completed=%d workers=%d elapsed=%s soft_go_memory_target_mib=%s baseline_heap_alloc=%d final_heap_alloc=%d baseline_heap_objects=%d final_heap_objects=%d diagnostic_only=true",
-		config.TotalOperations, result.Completed, config.Workers, result.Duration, target,
+	mode, requested := "count", fmt.Sprint(config.TotalOperations)
+	if config.Duration != "" {
+		mode, requested = "duration", config.Duration
+	}
+	t.Logf("configuration: mode=%s workers=%d total_operations=%d duration=%s max_open_connections=%d timeout=%s soft_go_memory_target_mib=%s effective_go_memory_limit_bytes=%d go=%s",
+		mode, config.Workers, config.TotalOperations, config.Duration, config.MaxOpenConnections, config.Timeout, target, result.MemoryLimitBytes, runtime.Version())
+	t.Logf("result: mode=%s requested=%s completed=%d workers=%d workload_elapsed=%s soft_go_memory_target_mib=%s baseline_checkpoint_complete=%t final_checkpoint_complete=%t baseline_heap_alloc=%d final_heap_alloc=%d baseline_heap_objects=%d final_heap_objects=%d diagnostic_only=true",
+		mode, requested, result.Completed, config.Workers, result.Duration, target, result.BaselineCheckpointComplete, result.FinalCheckpointComplete,
 		result.Baseline.HeapAlloc, result.Final.HeapAlloc, result.Baseline.HeapObjects, result.Final.HeapObjects)
 	if err != nil {
 		t.Fatal(redactRetentionText(err.Error(), TestingConfig))
 	}
-	t.Logf("cycles=%d SELECTs=%d rows=%d payload_bytes=%d active=%s drain=%s checkpoint_pause=%s wall=%s artifacts=%s", result.Counts.Cycles, result.Counts.Selects, result.Counts.Rows, result.Counts.PayloadBytes, result.Duration, result.Drain, result.Pauses, result.Wall, result.Artifact)
+	t.Logf("cycles=%d SELECTs=%d rows=%d payload_bytes=%d workload_elapsed=%s drain=%s checkpoint_pause=%s wall=%s artifacts=%s", result.Counts.Cycles, result.Counts.Selects, result.Counts.Rows, result.Counts.PayloadBytes, result.Duration, result.Drain, result.Pauses, result.Wall, result.Artifact)
 }
 
 func resourceRetentionStressEnabled() bool {
@@ -108,12 +144,6 @@ func resourceRetentionStressEnabled() bool {
 		}
 	}
 	return false
-}
-
-// Keep the database-free factory seam used by existing unit tests, but route
-// smoke and expanded workloads through the same implementation.
-func executeResourceRetention(config oracleTest.ResourceRetentionConfig, openDB func(context.Context) (*sql.DB, error)) (resourceRetentionResult, error) {
-	return executeExpandedResourceRetention(config, newRetentionRunID(), nil, openDB)
 }
 
 func primeResourceRetentionPool(ctx context.Context, db *sql.DB, count int, operationTimeout ...time.Duration) (err error) {
@@ -162,20 +192,6 @@ func resourceRetentionWorkerOperations(total, workers, worker int) int {
 		count++
 	}
 	return count
-}
-
-func runResourceRetentionWorkers(ctx context.Context, workers, total int, operation func(context.Context, int, int) error) (int, error) {
-	if workers <= 0 || total < workers {
-		return 0, fmt.Errorf("workload requires positive workers and at least one operation per worker")
-	}
-	// Compatibility adapter for the original fixed-count unit-test seam.
-	config := oracleTest.ResourceRetentionConfig{Workers: workers, TotalOperations: total}.Normalized()
-	p := &retentionProgress{}
-	_, _, err := runRetentionEpoch(ctx, config, make([]int, workers), 0, p, func(ctx context.Context, worker, index int) (retentionCounts, error) {
-		err := operation(ctx, worker, index)
-		return retentionCounts{Cycles: 1}, err
-	})
-	return int(p.snapshot().Cycles), err
 }
 
 // Warm-up uses the same worker runner, but separate counts and schedule indices.
@@ -348,7 +364,55 @@ func retentionCleanup(resource string, err error) error {
 	if err == nil {
 		return nil
 	}
-	return fmt.Errorf("cleanup %s: %w", resource, err)
+	return &retentionCleanupError{resource: resource, err: err}
+}
+
+// A failed close/rollback is independent evidence, even when it wraps cancellation.
+type retentionCleanupError struct {
+	resource string
+	err      error
+}
+
+func (e *retentionCleanupError) Error() string {
+	return fmt.Sprintf("cleanup %s: %v", e.resource, e.err)
+}
+func (e *retentionCleanupError) Unwrap() error { return e.err }
+
+func retentionCancellationOnly(err, primary error) bool {
+	if _, cleanup := err.(*retentionCleanupError); cleanup {
+		return false
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, child := range joined.Unwrap() {
+			if !retentionCancellationOnly(child, primary) {
+				return false
+			}
+		}
+		return true
+	}
+	if child := errors.Unwrap(err); child != nil {
+		if primary != nil && errors.Is(err, primary) && !errors.Is(child, primary) {
+			return true
+		}
+		return retentionCancellationOnly(child, primary)
+	}
+	return errors.Is(err, context.Canceled) || primary != nil && errors.Is(err, primary)
+}
+
+// Split explicit joins only. Keep unfamiliar mixed wrappers intact so filtering
+// cannot discard an independent cause or its original error type/stage context.
+func retentionIndependentError(err, primary error) error {
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		var independent error
+		for _, child := range joined.Unwrap() {
+			independent = errors.Join(independent, retentionIndependentError(child, primary))
+		}
+		return independent
+	}
+	if retentionCancellationOnly(err, primary) {
+		return nil
+	}
+	return err
 }
 
 // Stmt.QueryContext lacks the SQL argument used by DB/Tx/Conn.QueryContext.
@@ -1023,11 +1087,7 @@ func (r *retentionRecorder) progress(name string, db *sql.DB, p *retentionProgre
 	}
 	r.stage, r.stageStatus = name, "running"
 	r.stageStarted = time.Now()
-	if err := r.writeStageLocked("stage_start", name, r.stageStarted, nil); err != nil {
-		return err
-	}
-	_, err := r.sampleLocked("natural", -1, db, p)
-	return err
+	return r.writeStageLocked("stage_start", name, r.stageStarted, nil)
 }
 
 func (r *retentionRecorder) finish(err error, db *sql.DB, p *retentionProgress) error {
@@ -1046,8 +1106,13 @@ func (r *retentionRecorder) finishLocked(err error, db *sql.DB, p *retentionProg
 		err = fmt.Errorf("stage %s: %w", r.stage, err)
 	}
 	err = errors.Join(err, r.writeStageLocked("stage_end", r.stage, r.stageStarted, err))
-	_, sampleErr := r.sampleLocked("natural", -1, db, p)
-	return errors.Join(err, sampleErr)
+	if err != nil {
+		// Preserve failed-stage observations without duplicating every successful
+		// transition. Periodic and drained samples provide normal runtime state.
+		_, sampleErr := r.sampleLocked("natural", -1, db, p)
+		err = errors.Join(err, sampleErr)
+	}
+	return err
 }
 
 func (r *retentionRecorder) writeStageLocked(phase, name string, began time.Time, err error) error {
@@ -1185,13 +1250,46 @@ func runRetentionEpoch(ctx context.Context, config oracleTest.ResourceRetentionC
 	if !admissionDeadline.IsZero() {
 		drain = max(time.Duration(0), time.Since(admissionDeadline))
 	}
-	err = context.Cause(workCtx)
-	for _, e := range errorsByWorker {
-		if e != nil && e != err {
+	primary := context.Cause(workCtx)
+	err = primary
+	for worker, e := range errorsByWorker {
+		if e == nil || e == primary {
+			continue
+		}
+		if inner := errors.Unwrap(e); inner != nil {
+			if independent := retentionIndependentError(inner, primary); independent != nil {
+				err = errors.Join(err, fmt.Errorf("worker %d operation %d: %w", worker+1, indices[worker]+1, independent))
+			}
+		} else {
+			// Panic/accounting errors already carry their worker context.
 			err = errors.Join(err, e)
 		}
 	}
 	return
+}
+
+// Report only allowlisted information embedded in the running executable. The
+// checkout's HEAD is not evidence of which source built a copied test binary.
+func retentionBuildMetadata(info *debug.BuildInfo) map[string]any {
+	metadata := map[string]any{
+		"source": "runtime/debug.ReadBuildInfo", "available": info != nil,
+		"vcs_revision": "unavailable", "vcs_modified": nil,
+	}
+	if info != nil {
+		for _, setting := range info.Settings {
+			switch setting.Key {
+			case "vcs.revision":
+				if setting.Value != "" {
+					metadata["vcs_revision"] = setting.Value
+				}
+			case "vcs.modified":
+				if setting.Value == "true" || setting.Value == "false" {
+					metadata["vcs_modified"] = setting.Value == "true"
+				}
+			}
+		}
+	}
+	return metadata
 }
 
 func executeExpandedResourceRetention(config oracleTest.ResourceRetentionConfig, runID string, testConfig *TestConfig, openDB func(context.Context) (*sql.DB, error)) (result resourceRetentionResult, err error) {
@@ -1235,13 +1333,14 @@ func executeExpandedResourceRetention(config oracleTest.ResourceRetentionConfig,
 		"profile": config, "fixture_version": retentionFixtureVersion, "lob_bytes_per_column": retentionLOBBytes, "json_padding_bytes": retentionJSONPadding,
 		"oracle_monitoring": "external_optional", "os_monitoring": "external_windows_optional", "tls_version_cipher": "externally_verified_or_unavailable", "commit": "unavailable",
 	}
-	if build, ok := debug.ReadBuildInfo(); ok {
-		for _, setting := range build.Settings {
-			if setting.Key == "vcs.revision" {
-				metadata["commit"] = setting.Value
-			}
-		}
+	build, _ := debug.ReadBuildInfo()
+	buildMetadata := retentionBuildMetadata(build)
+	metadata["build"], metadata["commit"] = buildMetadata, buildMetadata["vcs_revision"]
+	executable, executableErr := os.Executable()
+	if executableErr != nil {
+		executable = "unavailable"
 	}
+	metadata["executable_path"] = executable
 	if testConfig != nil {
 		metadata["config_name"] = testConfig.ConfigName
 		metadata["database_version"] = testConfig.DatabaseVersion
@@ -1258,13 +1357,6 @@ func executeExpandedResourceRetention(config oracleTest.ResourceRetentionConfig,
 				return result, errors.New("expanded fixtures require StrictNullValueHandling=true")
 			}
 		}
-	}
-	if metadata["commit"] == "unavailable" {
-		gitCtx, done := context.WithTimeout(context.Background(), 2*time.Second)
-		if output, e := exec.CommandContext(gitCtx, "git", "rev-parse", "HEAD").Output(); e == nil {
-			metadata["commit"] = strings.TrimSpace(string(output))
-		}
-		done()
 	}
 	metadata["lob_prefetch_default_bytes"] = NewOracleDriverConfig().DriverProperties.DefaultLobPrefetchSize
 	if err = recorder.event(metadata); err != nil {
@@ -1292,12 +1384,19 @@ func executeExpandedResourceRetention(config oracleTest.ResourceRetentionConfig,
 			err = errors.Join(err, sampleErr)
 		}
 		err = recorder.finish(err, db, p)
-		poolClosed := false
+		poolCloseAttempted := db != nil
+		var poolCloseErr error
 		if db != nil {
 			err = errors.Join(err, recorder.progress("database_cleanup", db, p))
-			closeErr := db.Close()
-			poolClosed = closeErr == nil
-			err = errors.Join(err, recorder.finish(closeErr, nil, p))
+			poolCloseErr = db.Close()
+			closeReportErr := recorder.finish(poolCloseErr, db, p)
+			err = errors.Join(err, closeReportErr)
+			if closeReportErr == nil {
+				// Stats remain available after Close. A nil handle would fabricate
+				// zero-valued pool fields instead of observing the closed pool.
+				_, sampleErr := recorder.sample("natural", -1, db, p)
+				err = errors.Join(err, sampleErr)
+			}
 		}
 		status := "complete"
 		if err != nil {
@@ -1305,10 +1404,15 @@ func executeExpandedResourceRetention(config oracleTest.ResourceRetentionConfig,
 		}
 		err = errors.Join(err, recorder.event(map[string]any{
 			"phase": "result", "run_id": runID, "timestamp_utc": time.Now().UTC(), "status": status,
-			"counts": result.Counts, "active_ns": result.Duration.Nanoseconds(), "drain_ns": result.Drain.Nanoseconds(),
+			"counts": result.Counts, "workload_elapsed_ns": result.Duration.Nanoseconds(),
+			// Legacy active_ns also includes draining; retain its value for readers.
+			"active_ns": result.Duration.Nanoseconds(), "drain_ns": result.Drain.Nanoseconds(),
 			"checkpoint_pause_ns": result.Pauses.Nanoseconds(), "wall_ns": time.Since(began).Nanoseconds(),
-			"baseline": result.Baseline, "final": result.Final, "pool_closed": poolClosed,
-			"error": redactRetentionText(safeRetentionError(err), testConfig), "diagnostic_only": true,
+			"baseline": result.Baseline, "final": result.Final,
+			"baseline_checkpoint_complete": result.BaselineCheckpointComplete, "final_checkpoint_complete": result.FinalCheckpointComplete,
+			"pool_closed": poolCloseAttempted && poolCloseErr == nil, "pool_close_attempted": poolCloseAttempted,
+			"pool_close_error": redactRetentionText(safeRetentionError(poolCloseErr), testConfig),
+			"error":            redactRetentionText(safeRetentionError(err), testConfig), "diagnostic_only": true,
 		}))
 		if panicValue != nil {
 			panic(panicValue)
@@ -1383,6 +1487,9 @@ func executeExpandedResourceRetention(config oracleTest.ResourceRetentionConfig,
 	if err = primeResourceRetentionPool(ctx, db, config.MaxOpenConnections, operationTimeout); err != nil {
 		return
 	}
+	if _, err = recorder.sample("natural", -1, db, p); err != nil {
+		return
+	}
 	if err = recorder.progress("fixture_checks", db, p); err != nil {
 		return
 	}
@@ -1403,6 +1510,7 @@ func executeExpandedResourceRetention(config oracleTest.ResourceRetentionConfig,
 		return
 	}
 	result.Baseline, err = recorder.checkpoint(0, db, p, config.DiagnosticProfiles, dir)
+	result.BaselineCheckpointComplete = err == nil
 	if err != nil {
 		return
 	}
@@ -1463,6 +1571,7 @@ func executeExpandedResourceRetention(config oracleTest.ResourceRetentionConfig,
 		return result, errors.Join(err, reportErr)
 	}
 	result.Final, e = recorder.checkpoint(checkpoint, db, p, config.DiagnosticProfiles, dir)
+	result.FinalCheckpointComplete = e == nil
 	e = errors.Join(e, ctx.Err())
 	if config.DiagnosticProfiles {
 		e = errors.Join(e, writeRetentionProfile(filepath.Join(dir, "goroutines.txt"), "goroutine", 2))
@@ -1538,50 +1647,4 @@ func containsRetentionTable(tables []string, want string) bool {
 		}
 	}
 	return false
-}
-
-func TestRetentionDatabaseVersionDiagnostic(t *testing.T) {
-	if TestingConfig == nil {
-		t.Fatal("select a database configuration")
-	}
-
-	connector, err := openTestConnectorWithConfig(TestingConfig)
-	if err != nil {
-		t.Fatal(redactRetentionText(err.Error(), TestingConfig))
-	}
-	db := sql.OpenDB(connector)
-	defer func() {
-		if err := db.Close(); err != nil {
-			t.Error(redactRetentionText(err.Error(), TestingConfig))
-		}
-	}()
-
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-
-	rows, err := db.QueryContext(ctx,
-		"SELECT product, version, version_full FROM product_component_version")
-	if err != nil {
-		t.Fatal(redactRetentionText(err.Error(), TestingConfig))
-	}
-	defer func() {
-		if err := rows.Close(); err != nil {
-			t.Error(err)
-		}
-	}()
-
-	count := 0
-	for rows.Next() {
-		var product, version, full sql.NullString
-		if err := rows.Scan(&product, &version, &full); err != nil {
-			t.Fatal(err)
-		}
-		t.Logf("product=%q version=%q version_full=%q",
-			product.String, version.String, full.String)
-		count++
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatal(err)
-	}
-	t.Logf("returned_rows=%d", count)
 }

@@ -584,6 +584,31 @@ func TestResourceRetentionLifecycles(t *testing.T) {
 
 func TestResourceRetentionEpochsAndArtifacts(t *testing.T) {
 	config := oracleTest.ResourceRetentionConfig{Workers: 4, MaxOpenConnections: 4, TotalOperations: 12, Timeout: "2s", OperationTimeout: "1s"}.Normalized()
+	t.Run("allowlisted executable metadata", func(t *testing.T) {
+		for _, tc := range []struct {
+			name     string
+			info     *debug.BuildInfo
+			revision string
+			modified any
+		}{
+			{name: "unavailable", revision: "unavailable"},
+			{name: "no VCS", info: &debug.BuildInfo{}, revision: "unavailable"},
+			{name: "modified", info: &debug.BuildInfo{Settings: []debug.BuildSetting{{Key: "vcs.revision", Value: "embedded-revision"}, {Key: "vcs.modified", Value: "true"}, {Key: "private-setting", Value: "unit-secret"}}}, revision: "embedded-revision", modified: true},
+			{name: "clean", info: &debug.BuildInfo{Settings: []debug.BuildSetting{{Key: "vcs.modified", Value: "false"}}}, revision: "unavailable", modified: false},
+			{name: "unknown modified", info: &debug.BuildInfo{Settings: []debug.BuildSetting{{Key: "vcs.modified", Value: "unknown"}}}, revision: "unavailable"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				metadata := retentionBuildMetadata(tc.info)
+				if len(metadata) != 4 || metadata["source"] != "runtime/debug.ReadBuildInfo" || metadata["available"] != (tc.info != nil) || metadata["vcs_revision"] != tc.revision || metadata["vcs_modified"] != tc.modified {
+					t.Fatalf("incorrect executable attribution: %+v", metadata)
+				}
+				data, err := json.Marshal(metadata)
+				if err != nil || strings.Contains(string(data), "unit-secret") || strings.Contains(string(data), "private-setting") {
+					t.Fatalf("non-allowlisted build information: %s %v", data, err)
+				}
+			})
+		}
+	})
 	indices := make([]int, 4)
 	p := &retentionProgress{}
 	var inFlight atomic.Int64
@@ -715,6 +740,27 @@ func TestResourceRetentionEpochsAndArtifacts(t *testing.T) {
 			t.Fatalf("result=%+v err=%v", result, err)
 		}
 	})
+	t.Run("checkpoint completion includes requested profiles", func(t *testing.T) {
+		for _, name := range []string{"heap-000.pprof", "heap-001.pprof"} {
+			t.Run(name, func(t *testing.T) {
+				c := config
+				c.OutputDirectory, c.DiagnosticProfiles = t.TempDir(), true
+				fake := &retentionFakeConnector{}
+				result, err := executeExpandedResourceRetention(c, "profile-error", nil, func(context.Context) (*sql.DB, error) {
+					// Occupy the requested profile path without changing the writer or
+					// filesystem implementation. Existing evidence must not be replaced.
+					if err := os.Mkdir(filepath.Join(c.OutputDirectory, "profile-error", name), 0700); err != nil {
+						return nil, err
+					}
+					return sql.OpenDB(fake), nil
+				})
+				wantBaseline := name == "heap-001.pprof"
+				if err == nil || result.BaselineCheckpointComplete != wantBaseline || result.FinalCheckpointComplete || fake.closed.Load() != fake.opened.Load() {
+					t.Fatalf("profile failure reported a completed checkpoint or leaked pool: %+v %v", result, err)
+				}
+			})
+		}
+	})
 	t.Run("full smoke artifacts and closure", func(t *testing.T) {
 		c := config
 		c.OutputDirectory = t.TempDir()
@@ -734,6 +780,51 @@ func TestResourceRetentionEpochsAndArtifacts(t *testing.T) {
 		if !strings.Contains(string(data), `"artifact_format_version":2`) || strings.Contains(string(data), "retained_growth_review") {
 			t.Fatal("incorrect artifact version or obsolete heuristic")
 		}
+		decoder := json.NewDecoder(strings.NewReader(string(data)))
+		naturalSamples, results := 0, 0
+		for {
+			var record struct {
+				Phase, Stage, Commit string
+				ExecutablePath       string         `json:"executable_path"`
+				Build                map[string]any `json:"build"`
+				PoolAvailable        bool           `json:"pool_available"`
+				Pool                 sql.DBStats
+				WorkloadElapsed      int64  `json:"workload_elapsed_ns"`
+				Active               int64  `json:"active_ns"`
+				PoolClosed           bool   `json:"pool_closed"`
+				PoolCloseAttempted   bool   `json:"pool_close_attempted"`
+				PoolCloseError       string `json:"pool_close_error"`
+				BaselineComplete     bool   `json:"baseline_checkpoint_complete"`
+				FinalComplete        bool   `json:"final_checkpoint_complete"`
+			}
+			if err := decoder.Decode(&record); err == io.EOF {
+				break
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			switch record.Phase {
+			case "configuration":
+				if record.ExecutablePath == "" || record.Build["source"] != "runtime/debug.ReadBuildInfo" || record.Commit != record.Build["vcs_revision"] {
+					t.Fatalf("incorrect executable metadata: %+v", record)
+				}
+			case "natural":
+				naturalSamples++
+				if record.Stage != "pool_priming" && record.Stage != "database_cleanup" {
+					t.Fatalf("redundant stage-boundary snapshot: %s", record.Stage)
+				}
+				if record.Stage == "database_cleanup" && (!record.PoolAvailable || record.Pool.MaxOpenConnections != c.MaxOpenConnections || record.Pool.OpenConnections != 0 || record.Pool.InUse != 0) {
+					t.Fatalf("not observing actual post-close pool state: %+v", record)
+				}
+			case "result":
+				results++
+				if record.WorkloadElapsed != result.Duration.Nanoseconds() || record.Active != record.WorkloadElapsed || !record.PoolClosed || !record.PoolCloseAttempted || record.PoolCloseError != "" || !record.BaselineComplete || !record.FinalComplete {
+					t.Fatalf("incorrect result semantics: %+v", record)
+				}
+			}
+		}
+		if naturalSamples != 2 || results != 1 || !result.BaselineCheckpointComplete || !result.FinalCheckpointComplete {
+			t.Fatalf("unexpected natural/result records or checkpoints: natural=%d result=%d", naturalSamples, results)
+		}
 		if _, err = os.Stat(filepath.Join(filepath.Dir(result.Artifact), "goroutines.txt")); err != nil {
 			t.Fatal(err)
 		}
@@ -743,6 +834,80 @@ func TestResourceRetentionEpochsAndArtifacts(t *testing.T) {
 type retentionBrokenWriter struct{}
 
 func TestResourceRetentionSetupDiagnostics(t *testing.T) {
+	t.Run("setup and pool closure result semantics", func(t *testing.T) {
+		for _, scenario := range []string{"initialize error", "priming error", "pool close error"} {
+			t.Run(scenario, func(t *testing.T) {
+				config := oracleTest.ResourceRetentionConfig{Workers: 1, TotalOperations: 1, MaxOpenConnections: 1, Timeout: "1s", OutputDirectory: t.TempDir()}
+				cause := errors.New(scenario)
+				fake := &retentionFakeConnector{}
+				if scenario == "priming error" {
+					fake.query = func(context.Context, int64) (driver.Rows, error) { return nil, cause }
+				}
+				if scenario == "pool close error" {
+					fake.closeError = cause
+				}
+				result, err := executeExpandedResourceRetention(config, "result-semantics", nil, func(context.Context) (*sql.DB, error) {
+					if scenario == "initialize error" {
+						return nil, cause
+					}
+					return sql.OpenDB(fake), nil
+				})
+				if !errors.Is(err, cause) {
+					t.Fatalf("lost failure cause: %v", err)
+				}
+				data, err := os.ReadFile(result.Artifact)
+				if err != nil {
+					t.Fatal(err)
+				}
+				decoder := json.NewDecoder(strings.NewReader(string(data)))
+				resultSeen, postCloseSamples := false, 0
+				for {
+					var record struct {
+						Phase, Stage, Status string
+						PoolAvailable        bool `json:"pool_available"`
+						Pool                 sql.DBStats
+						PoolClosed           bool   `json:"pool_closed"`
+						PoolCloseAttempted   bool   `json:"pool_close_attempted"`
+						PoolCloseError       string `json:"pool_close_error"`
+						BaselineComplete     bool   `json:"baseline_checkpoint_complete"`
+						FinalComplete        bool   `json:"final_checkpoint_complete"`
+					}
+					if err := decoder.Decode(&record); err == io.EOF {
+						break
+					} else if err != nil {
+						t.Fatal(err)
+					}
+					if record.Phase == "natural" && record.Stage == "database_cleanup" {
+						postCloseSamples++
+						if !record.PoolAvailable || record.Pool.MaxOpenConnections != 1 || record.Pool.OpenConnections != 0 || record.Pool.InUse != 0 {
+							t.Fatalf("fabricated/missing pool measurement: %+v", record)
+						}
+					}
+					if scenario == "initialize error" && record.PoolAvailable {
+						t.Fatal("reported pool statistics without a database handle")
+					}
+					if record.Phase == "result" {
+						resultSeen = true
+						wantClose := scenario != "initialize error"
+						wantCheckpoint := scenario == "pool close error"
+						if record.Status != "failed" || record.PoolCloseAttempted != wantClose || record.PoolClosed != (scenario == "priming error") || record.BaselineComplete != wantCheckpoint || record.FinalComplete != wantCheckpoint {
+							t.Fatalf("misleading setup/closure outcome: %+v", record)
+						}
+						if scenario == "pool close error" && record.PoolCloseError != cause.Error() || scenario != "pool close error" && record.PoolCloseError != "" {
+							t.Fatalf("incorrect pool close error: %+v", record)
+						}
+					}
+				}
+				wantSamples := 1
+				if scenario == "initialize error" {
+					wantSamples = 0
+				}
+				if !resultSeen || postCloseSamples != wantSamples {
+					t.Fatalf("missing result or duplicated post-close snapshots: result=%v samples=%d", resultSeen, postCloseSamples)
+				}
+			})
+		}
+	})
 	t.Run("setup deadline records failure and cleans up", func(t *testing.T) {
 		config := oracleTest.ResourceRetentionConfig{Workers: 1, TotalOperations: 1, MaxOpenConnections: 1, Timeout: "5s", OperationTimeout: "10ms", SampleInterval: "1ms", OutputDirectory: t.TempDir()}
 		fake := &retentionFakeConnector{}
@@ -879,10 +1044,12 @@ func TestResourceRetentionSetupDiagnostics(t *testing.T) {
 		var stages []string
 		active := ""
 		poolClosed := false
+		postCloseSamples := 0
 		for {
 			var record struct {
 				Phase, Stage, Status string
 				PoolAvailable        bool `json:"pool_available"`
+				Pool                 sql.DBStats
 			}
 			if err := decoder.Decode(&record); err == io.EOF {
 				break
@@ -903,12 +1070,15 @@ func TestResourceRetentionSetupDiagnostics(t *testing.T) {
 				active = ""
 				poolClosed = record.Stage == "database_cleanup"
 			}
-			if poolClosed && record.PoolAvailable {
-				t.Fatal("sampled closed pool")
+			if poolClosed && record.Phase == "natural" {
+				postCloseSamples++
+				if !record.PoolAvailable || record.Pool.MaxOpenConnections != 1 || record.Pool.OpenConnections != 0 || record.Pool.InUse != 0 {
+					t.Fatal("post-close sample did not observe the actual pool")
+				}
 			}
 		}
 		want := "database_initialization,pool_priming,fixture_checks,warm_up,baseline_checkpoint,measured_workload,final_fixture_verification,final_checkpoint,database_cleanup"
-		if active != "" || strings.Join(stages, ",") != want {
+		if active != "" || strings.Join(stages, ",") != want || postCloseSamples != 1 {
 			t.Fatalf("stage order: %v", stages)
 		}
 		// Once the runner returns there must be no collector left writing.
@@ -1445,11 +1615,75 @@ func TestResourceRetentionSelectHelper(t *testing.T) {
 }
 
 func TestResourceRetentionWorkers(t *testing.T) {
+	t.Run("bounded independent failures after cancellation", func(t *testing.T) {
+		primary := errors.New("primary SELECT failed")
+		independent := &os.PathError{Op: "query", Path: "unit", Err: errors.New("independent SELECT failed")}
+		rowClose, connClose := errors.New("row close failed"), errors.New("connection close failed")
+		config := oracleTest.ResourceRetentionConfig{Workers: 4, TotalOperations: 4, OperationTimeout: "1s"}.Normalized()
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		var entered, exited atomic.Int64
+		allEntered := make(chan struct{})
+		progress := &retentionProgress{}
+		_, _, err := runRetentionEpoch(ctx, config, make([]int, config.Workers), 0, progress, func(ctx context.Context, worker, operation int) (retentionCounts, error) {
+			defer exited.Add(1)
+			if entered.Add(1) == int64(config.Workers) {
+				close(allEntered)
+			}
+			select {
+			case <-allEntered:
+			case <-ctx.Done():
+				return retentionCounts{}, ctx.Err()
+			}
+			if worker == 0 {
+				return retentionCounts{}, primary
+			}
+			<-ctx.Done()
+			switch worker {
+			case 1:
+				return retentionCounts{}, errors.Join(independent, retentionCleanup("rows", rowClose), retentionCleanup("connection", connClose))
+			case 2:
+				return retentionCounts{}, errors.Join(fmt.Errorf("transport read: %w", context.Cause(ctx)), retentionCleanup("rows", context.Canceled))
+			default:
+				return retentionCounts{}, fmt.Errorf("transport read: %w", context.Cause(ctx))
+			}
+		})
+		var detail *os.PathError
+		if !errors.Is(err, primary) || !errors.As(err, &detail) || detail != independent || !errors.Is(err, rowClose) || !errors.Is(err, connClose) || !errors.Is(err, context.Canceled) {
+			t.Fatalf("lost primary, typed independent, or cleanup failure: %v", err)
+		}
+		message := err.Error()
+		second, third := strings.Index(message, "worker 2 operation 1:"), strings.Index(message, "worker 3 operation 1:")
+		if !strings.HasPrefix(message, "worker 1 operation 1:") || strings.Count(message, primary.Error()) != 1 || second < 0 || third <= second || strings.Contains(message, "worker 4") || !strings.Contains(message, "cleanup rows: context canceled") {
+			t.Fatalf("incorrect primary/cancellation ordering: %v", err)
+		}
+		if entered.Load() != 4 || exited.Load() != 4 || progress.snapshot().Cycles != 0 {
+			t.Fatal("workers were abandoned, retried, or counted as successful")
+		}
+	})
+	t.Run("unknown mixed wrappers keep independent evidence", func(t *testing.T) {
+		primary, independent := errors.New("primary"), errors.New("independent")
+		cleanup := retentionCleanup("rows", context.Canceled)
+		mixed := fmt.Errorf("opaque operation: %w", errors.Join(primary, cleanup, independent))
+		filtered := retentionIndependentError(mixed, primary)
+		if filtered != mixed || !errors.Is(filtered, primary) || !errors.Is(filtered, cleanup) || !errors.Is(filtered, independent) {
+			t.Fatalf("lost unfamiliar wrapper or its causes: %v", filtered)
+		}
+		if filtered = retentionIndependentError(errors.Join(fmt.Errorf("read: %w", primary), cleanup, independent), primary); !errors.Is(filtered, cleanup) || !errors.Is(filtered, independent) || errors.Is(filtered, primary) {
+			t.Fatalf("explicit join filtering lost independent evidence: %v", filtered)
+		}
+	})
 	t.Run("distribution and accounting", func(t *testing.T) {
 		for _, total := range []int{4, 10, 1024} {
 			var counts [4]int
-			completed, err := runResourceRetentionWorkers(context.Background(), 4, total,
-				func(ctx context.Context, worker, operation int) error { counts[worker]++; return nil })
+			config := oracleTest.ResourceRetentionConfig{Workers: 4, TotalOperations: total}.Normalized()
+			progress := &retentionProgress{}
+			_, _, err := runRetentionEpoch(context.Background(), config, make([]int, 4), 0, progress,
+				func(ctx context.Context, worker, operation int) (retentionCounts, error) {
+					counts[worker]++
+					return retentionCounts{Cycles: 1}, nil
+				})
+			completed := int(progress.snapshot().Cycles)
 			if err != nil || completed != total {
 				t.Fatalf("completed=%d error=%v", completed, err)
 			}
@@ -1469,17 +1703,20 @@ func TestResourceRetentionWorkers(t *testing.T) {
 		defer cancel()
 		var entered atomic.Int64
 		release := make(chan struct{})
-		completed, err := runResourceRetentionWorkers(ctx, 4, 4, func(ctx context.Context, worker, operation int) error {
+		config := oracleTest.ResourceRetentionConfig{Workers: 4, TotalOperations: 4}.Normalized()
+		progress := &retentionProgress{}
+		_, _, err := runRetentionEpoch(ctx, config, make([]int, 4), 0, progress, func(ctx context.Context, worker, operation int) (retentionCounts, error) {
 			if entered.Add(1) == 4 {
 				close(release)
 			}
 			select {
 			case <-release:
-				return nil
+				return retentionCounts{Cycles: 1}, nil
 			case <-ctx.Done():
-				return ctx.Err()
+				return retentionCounts{}, ctx.Err()
 			}
 		})
+		completed := int(progress.snapshot().Cycles)
 		if err != nil || completed != 4 {
 			t.Fatalf("workers did not overlap: %d %v", completed, err)
 		}
@@ -1487,14 +1724,17 @@ func TestResourceRetentionWorkers(t *testing.T) {
 	t.Run("first error cancels and joins siblings", func(t *testing.T) {
 		cause := errors.New("SELECT failed")
 		var exited atomic.Int64
-		completed, err := runResourceRetentionWorkers(context.Background(), 4, 1024, func(ctx context.Context, worker, operation int) error {
+		config := oracleTest.ResourceRetentionConfig{Workers: 4, TotalOperations: 1024}.Normalized()
+		progress := &retentionProgress{}
+		_, _, err := runRetentionEpoch(context.Background(), config, make([]int, 4), 0, progress, func(ctx context.Context, worker, operation int) (retentionCounts, error) {
 			defer exited.Add(1)
 			if worker == 0 {
-				return cause
+				return retentionCounts{}, cause
 			}
 			<-ctx.Done()
-			return ctx.Err()
+			return retentionCounts{}, ctx.Err()
 		})
+		completed := int(progress.snapshot().Cycles)
 		if completed != 0 || !errors.Is(err, cause) || !strings.Contains(err.Error(), "worker 1 operation 1") {
 			t.Fatalf("completed=%d error=%v", completed, err)
 		}
@@ -1505,12 +1745,15 @@ func TestResourceRetentionWorkers(t *testing.T) {
 	})
 	t.Run("partial successful work", func(t *testing.T) {
 		cause := errors.New("second operation failed")
-		completed, err := runResourceRetentionWorkers(context.Background(), 1, 4, func(ctx context.Context, worker, operation int) error {
+		config := oracleTest.ResourceRetentionConfig{Workers: 1, TotalOperations: 4}.Normalized()
+		progress := &retentionProgress{}
+		_, _, err := runRetentionEpoch(context.Background(), config, make([]int, 1), 0, progress, func(ctx context.Context, worker, operation int) (retentionCounts, error) {
 			if operation == 1 {
-				return cause
+				return retentionCounts{}, cause
 			}
-			return nil
+			return retentionCounts{Cycles: 1}, nil
 		})
+		completed := int(progress.snapshot().Cycles)
 		if completed != 1 || !errors.Is(err, cause) {
 			t.Fatalf("completed=%d error=%v", completed, err)
 		}
@@ -1518,25 +1761,24 @@ func TestResourceRetentionWorkers(t *testing.T) {
 	t.Run("timeout", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 		defer cancel()
-		completed, err := runResourceRetentionWorkers(ctx, 4, 4, func(ctx context.Context, worker, operation int) error {
+		config := oracleTest.ResourceRetentionConfig{Workers: 4, TotalOperations: 4}.Normalized()
+		progress := &retentionProgress{}
+		_, _, err := runRetentionEpoch(ctx, config, make([]int, 4), 0, progress, func(ctx context.Context, worker, operation int) (retentionCounts, error) {
 			<-ctx.Done()
-			return ctx.Err()
+			return retentionCounts{}, ctx.Err()
 		})
+		completed := int(progress.snapshot().Cycles)
 		if completed != 0 || !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("completed=%d error=%v", completed, err)
 		}
 	})
 	t.Run("panic becomes failure", func(t *testing.T) {
-		completed, err := runResourceRetentionWorkers(context.Background(), 1, 1, func(context.Context, int, int) error { panic("unexpected panic") })
+		config := oracleTest.ResourceRetentionConfig{Workers: 1, TotalOperations: 1}.Normalized()
+		progress := &retentionProgress{}
+		_, _, err := runRetentionEpoch(context.Background(), config, make([]int, 1), 0, progress, func(context.Context, int, int) (retentionCounts, error) { panic("unexpected panic") })
+		completed := int(progress.snapshot().Cycles)
 		if completed != 0 || err == nil || !strings.Contains(err.Error(), "panicked") {
 			t.Fatalf("completed=%d error=%v", completed, err)
-		}
-	})
-	t.Run("invalid workload", func(t *testing.T) {
-		for _, settings := range [][2]int{{0, 1}, {-1, 1}, {4, 3}} {
-			if _, err := runResourceRetentionWorkers(context.Background(), settings[0], settings[1], nil); err == nil {
-				t.Fatal("accepted invalid workload")
-			}
 		}
 	})
 }
@@ -1594,6 +1836,7 @@ func TestResourceRetentionMemoryTargetRestoration(t *testing.T) {
 				connector.closeError = cause
 			}
 			current := config
+			current.OutputDirectory = t.TempDir()
 			if baseline {
 				current.MemoryLimitMiB = nil
 			}
@@ -1609,7 +1852,7 @@ func TestResourceRetentionMemoryTargetRestoration(t *testing.T) {
 			var panicked any
 			func() {
 				defer func() { panicked = recover() }()
-				result, runErr = executeResourceRetention(current, func(ctx context.Context) (*sql.DB, error) {
+				result, runErr = executeExpandedResourceRetention(current, "memory-target-test", nil, func(ctx context.Context) (*sql.DB, error) {
 					checkTarget()
 					if _, ok := ctx.Deadline(); !ok {
 						return nil, errors.New("no initialization deadline")
