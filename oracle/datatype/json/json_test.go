@@ -41,7 +41,6 @@ package json
 import (
 	"bytes"
 	"context"
-	"encoding/hex"
 	stdjson "encoding/json"
 	"errors"
 	"fmt"
@@ -53,6 +52,7 @@ import (
 	"testing"
 	"time"
 
+	drvCommon "github.com/oracle/go-oracledb/v26/internal/driver/common"
 	oracleErrors "github.com/oracle/go-oracledb/v26/oracle/errors"
 )
 
@@ -606,216 +606,84 @@ func TestJSONScanCopiesSourceBytes(t *testing.T) {
 	}
 }
 
-// OSON-F04 unit companion: this hand-audited wire fixture exercises ID even if
-// a live server normalizes EXTENDED $oid/$rawid values to ordinary binary.
-// Header: FF4A5A, version 1, flags 0016, 14-byte scalar tree. Tree: ID opcode
-// 7E, UB1 payload length 0C, then the twelve literal identifier bytes 00..0B.
-// This is valid public-Scanner fixture coverage, not evidence of a live ID fetch.
-func TestJSONIDScalarFixture(t *testing.T) {
-	fixture := []byte{
-		0xff, 0x4a, 0x5a, 0x01, 0x00, 0x16, 0x00, 0x0e,
-		0x7e, 0x0c, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05,
-		0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b,
+// TestJSONViewsPropagateNodeErrors checks the public wrappers without depending
+// on a particular OSON byte sequence. Codec fixtures are tested in oson.
+func TestJSONViewsPropagateNodeErrors(t *testing.T) {
+	sentinel := errors.New("test node error")
+	document := JSON{node: jsonErrorScalarNode{err: sentinel}}
+	object := JSONObject{node: jsonErrorObjectNode{err: sentinel}}
+	array := JSONArray{node: jsonErrorArrayNode{err: sentinel}}
+	scalar := JSONScalar{node: jsonErrorScalarNode{err: sentinel}}
+	tests := []struct {
+		name  string
+		value interface {
+			MarshalJSON() ([]byte, error)
+			String() string
+		}
+		getValue    func() (any, error)
+		placeholder string
+	}{
+		{"document", document, document.GetValue, "<JSON: rendering failed>"},
+		{"object", object, func() (any, error) { return object.GetValue() }, "<JSONObject: rendering failed>"},
+		{"array", array, func() (any, error) { return array.GetValue() }, "<JSONArray: rendering failed>"},
+		{"scalar", scalar, scalar.GetValue, "<JSONScalar: rendering failed>"},
 	}
-	want := []byte{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}
-	for _, mode := range []NumberMode{NumberDefault, NumberAsJSONNumber, NumberAsFloat64} {
-		var doc JSON
-		doc.SetOptions(Options{NumberMode: mode})
-		if err := doc.Scan(fixture); err != nil {
-			t.Fatalf("scan audited ID fixture: %v", err)
-		}
-		if kind, err := doc.Kind(); err != nil || kind != JSONScalarKind {
-			t.Fatalf("ID kind=%v (%v), want scalar", kind, err)
-		}
-		value, err := doc.GetValue()
-		actual, ok := value.([]byte)
-		if err != nil || !ok || !bytes.Equal(actual, want) {
-			t.Fatalf("ID value=%#v (%T), error=%v, want %x", value, value, err, want)
-		}
-		actual[0] ^= 0xff
-		again, err := doc.GetValue()
-		if err != nil || !bytes.Equal(again.([]byte), want) {
-			t.Fatalf("ID materialization exposed document-owned bytes: %v", err)
-		}
-		text, err := stdjson.Marshal(doc)
-		if err != nil || string(text) != `"000102030405060708090A0B"` {
-			t.Fatalf("ID hexadecimal JSON=%s (%v)", text, err)
-		}
-		wire, err := doc.Value()
-		if err != nil || !bytes.Equal(wire.([]byte), fixture) {
-			t.Fatalf("whole ID document rebinding changed its wire representation: %v", err)
-		}
-	}
-}
-
-// TestJSONMalformedCompactSignedOSON checks semantic payload validity through
-// the public Scanner. These are crafted malformed bytes, not normal DB input.
-func TestJSONMalformedCompactSignedOSON(t *testing.T) {
-	fixtures := []struct{ name, wire string }{
-		{"signed32_overflow", "ff4a5a010016000746c51630312531"},           // 2147483648 in SB4.
-		{"signed32_fraction", "ff4a5a010016000443c10233"},                 // 1.5 in SB4.
-		{"signed64_overflow", "ff4a5a010016000c5bca132d442d08260a381110"}, // uint64 maximum in SB8.
-	}
-	for _, fixture := range fixtures {
-		for _, mode := range []NumberMode{NumberDefault, NumberAsJSONNumber, NumberAsFloat64} {
-			t.Run(fmt.Sprintf("%s/mode_%d", fixture.name, mode), func(t *testing.T) {
-				data, err := hex.DecodeString(fixture.wire)
-				if err != nil {
-					t.Fatalf("invalid fixture: %v", err)
-				}
-				var doc JSON
-				doc.SetOptions(Options{NumberMode: mode})
-				if err = doc.Scan(data); err != nil {
-					return
-				}
-				if value, err := doc.GetValue(); err == nil {
-					t.Errorf("invalid signed payload materialized as %v (%T), want rejection", value, value)
-				}
-				if text, err := stdjson.Marshal(doc); err == nil {
-					t.Errorf("invalid signed payload rendered as %s, want rejection", text)
-				}
-			})
-		}
-	}
-}
-
-// TestJSONUnsupportedOSONScalarAccess retains the documented #132 capability
-// boundary while testing public lazy access and error propagation. The payload
-// is synthetic; its bytes are deliberately uninterpreted for these opcodes.
-func TestJSONUnsupportedOSONScalarAccess(t *testing.T) {
-	for _, fixture := range []struct {
-		name   string
-		opcode byte
-	}{{"native_integer", 0x79}, {"extended_binary", 0x7b}} {
-		t.Run(fixture.name, func(t *testing.T) {
-			const marker = "UNSUPPORTED_SCALAR_MARKER"
-			doc := publicJSONWithUnsupportedScalar(t, map[string]any{"bad": marker, "good": "survives"}, marker, fixture.opcode)
-			object, err := doc.AsJSONObject()
-			if err != nil {
-				t.Fatal(err)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := tc.getValue(); !errors.Is(err, sentinel) {
+				t.Fatalf("GetValue() error = %v, want wrapped sentinel", err)
 			}
-			good, err := object.Get("good")
-			if err != nil {
-				t.Fatal(err)
+			if _, err := stdjson.Marshal(tc.value); !errors.Is(err, sentinel) {
+				t.Fatalf("json.Marshal() error = %v, want wrapped sentinel", err)
 			}
-			value, err := good.GetValue()
-			if err != nil || value != "survives" {
-				t.Fatalf("unaffected sibling=%v error=%v", value, err)
-			}
-			bad, err := object.Get("bad")
-			if err != nil {
-				t.Fatalf("construct lazy scalar: %v", err)
-			}
-			if kind, err := bad.Kind(); err != nil || kind != JSONScalarKind {
-				t.Fatalf("unsupported scalar kind=%v error=%v", kind, err)
-			}
-			for _, mode := range []NumberMode{NumberDefault, NumberAsJSONNumber, NumberAsFloat64} {
-				bad.SetOptions(Options{NumberMode: mode})
-				_, err := bad.GetValue()
-				requirePublicOSONRegressionCode(t, err, oracleErrors.OsonUnsupportedScalarError)
-				_, err = stdjson.Marshal(bad)
-				requirePublicOSONRegressionCode(t, err, oracleErrors.OsonUnsupportedScalarError)
-			}
-			_, err = doc.GetValue()
-			requirePublicOSONRegressionCode(t, err, oracleErrors.OsonUnsupportedScalarError)
-			_, err = stdjson.Marshal(doc)
-			requirePublicOSONRegressionCode(t, err, oracleErrors.OsonUnsupportedScalarError)
-			if got := doc.String(); got != "<JSON: rendering failed>" {
-				t.Fatalf("String=%q, want rendering failure placeholder", got)
-			}
-			_, err = object.GetValue()
-			requirePublicOSONRegressionCode(t, err, oracleErrors.OsonUnsupportedScalarError)
-			_, err = stdjson.Marshal(object)
-			requirePublicOSONRegressionCode(t, err, oracleErrors.OsonUnsupportedScalarError)
-			if got := object.String(); got != "<JSONObject: rendering failed>" {
-				t.Fatalf("JSONObject.String=%q, want rendering failure placeholder", got)
-			}
-			if got := bad.String(); got != "<JSON: rendering failed>" {
-				t.Fatalf("child JSON.String=%q, want rendering failure placeholder", got)
-			}
-			scalar, err := bad.AsJSONScalar()
-			if err != nil {
-				t.Fatalf("access unsupported scalar view: %v", err)
-			}
-			_, err = scalar.GetValue()
-			requirePublicOSONRegressionCode(t, err, oracleErrors.OsonUnsupportedScalarError)
-			_, err = stdjson.Marshal(scalar)
-			requirePublicOSONRegressionCode(t, err, oracleErrors.OsonUnsupportedScalarError)
-			if got := scalar.String(); got != "<JSONScalar: rendering failed>" {
-				t.Fatalf("JSONScalar.String=%q, want rendering failure placeholder", got)
-			}
-			if value, err := good.GetValue(); err != nil || value != "survives" {
-				t.Fatalf("supported object sibling after rendering failure=(%v,%v)", value, err)
-			}
-
-			arrayDoc := publicJSONWithUnsupportedScalar(t, []any{marker, "survives"}, marker, fixture.opcode)
-			array, err := arrayDoc.AsJSONArray()
-			if err != nil {
-				t.Fatal(err)
-			}
-			if array.Len() != 2 {
-				t.Fatalf("array length=%d, want 2", array.Len())
-			}
-			good, err = array.Get(1)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if value, err := good.GetValue(); err != nil || value != "survives" {
-				t.Fatalf("supported array sibling=(%v,%v)", value, err)
-			}
-			bad, err = array.Get(0)
-			if err != nil {
-				t.Fatalf("construct lazy unsupported array child: %v", err)
-			}
-			_, err = bad.GetValue()
-			requirePublicOSONRegressionCode(t, err, oracleErrors.OsonUnsupportedScalarError)
-			_, err = array.GetValue()
-			requirePublicOSONRegressionCode(t, err, oracleErrors.OsonUnsupportedScalarError)
-			_, err = stdjson.Marshal(array)
-			requirePublicOSONRegressionCode(t, err, oracleErrors.OsonUnsupportedScalarError)
-			if got := array.String(); got != "<JSONArray: rendering failed>" {
-				t.Fatalf("JSONArray.String=%q, want rendering failure placeholder", got)
-			}
-			_, err = stdjson.Marshal(arrayDoc)
-			requirePublicOSONRegressionCode(t, err, oracleErrors.OsonUnsupportedScalarError)
-			if got := arrayDoc.String(); got != "<JSON: rendering failed>" {
-				t.Fatalf("array document String=%q, want rendering failure placeholder", got)
-			}
-			if value, err := good.GetValue(); err != nil || value != "survives" {
-				t.Fatalf("supported array sibling after rendering failure=(%v,%v)", value, err)
-			}
-			if text, err := stdjson.Marshal(good); err != nil || string(text) != `"survives"` {
-				t.Fatalf("supported array sibling rendering=(%s,%v)", text, err)
+			if got := tc.value.String(); got != tc.placeholder {
+				t.Fatalf("String() = %q, want %q", got, tc.placeholder)
 			}
 		})
 	}
 }
 
-func publicJSONWithUnsupportedScalar(t *testing.T, input any, marker string, opcode byte) JSON {
-	t.Helper()
-	source, err := NewJSON(input)
-	if err != nil {
-		t.Fatal(err)
-	}
-	raw, err := source.Value()
-	if err != nil {
-		t.Fatal(err)
-	}
-	data, ok := raw.([]byte)
-	if !ok {
-		t.Fatalf("fixture Value type=%T, want []byte", raw)
-	}
-	at := bytes.Index(data, []byte(marker))
-	if at < 1 || bytes.Count(data, []byte(marker)) != 1 || data[at-1] != byte(len(marker)) {
-		t.Fatal("unexpected short-string fixture layout")
-	}
-	data[at-1] = opcode
-	var doc JSON
-	if err = doc.Scan(data); err != nil {
-		t.Fatalf("Scan must preserve lazy access to unaffected sibling: %v", err)
-	}
-	return doc
+type jsonErrorObjectNode struct {
+	drvCommon.JSONObjectNode
+	err error
 }
+
+func (n jsonErrorObjectNode) GetValue(drvCommon.JSONConversionOptions) (any, error) {
+	return nil, n.err
+}
+func (n jsonErrorObjectNode) Value(drvCommon.JSONConversionOptions) (map[string]any, error) {
+	return nil, n.err
+}
+func (n jsonErrorObjectNode) MarshalJSON() ([]byte, error) { return nil, n.err }
+func (n jsonErrorObjectNode) String() (string, error)      { return "", n.err }
+
+type jsonErrorArrayNode struct {
+	drvCommon.JSONArrayNode
+	err error
+}
+
+func (n jsonErrorArrayNode) GetValue(drvCommon.JSONConversionOptions) (any, error) {
+	return nil, n.err
+}
+func (n jsonErrorArrayNode) Value(drvCommon.JSONConversionOptions) ([]any, error) {
+	return nil, n.err
+}
+func (n jsonErrorArrayNode) MarshalJSON() ([]byte, error) { return nil, n.err }
+func (n jsonErrorArrayNode) String() (string, error)      { return "", n.err }
+
+type jsonErrorScalarNode struct {
+	drvCommon.JSONScalarNode
+	err error
+}
+
+func (n jsonErrorScalarNode) GetValue(drvCommon.JSONConversionOptions) (any, error) {
+	return nil, n.err
+}
+func (n jsonErrorScalarNode) Value(drvCommon.JSONConversionOptions) (any, error) {
+	return nil, n.err
+}
+func (n jsonErrorScalarNode) MarshalJSON() ([]byte, error) { return nil, n.err }
+func (n jsonErrorScalarNode) String() (string, error)      { return "", n.err }
 
 // TestJSONUnsupportedGoInputMatrix checks API type boundaries without requiring
 // a configured database. Defined Go types differ from true type aliases.
