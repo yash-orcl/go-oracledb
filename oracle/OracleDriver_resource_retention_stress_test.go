@@ -1440,6 +1440,7 @@ func executeExpandedResourceRetention(config oracleTest.ResourceRetentionConfig,
 	// and join it before closing the pool or artifact file.
 	var samplingCtx context.Context
 	samplingCtx, stopSampling = context.WithCancel(ctx)
+	defer stopSampling()
 	sampled = make(chan struct{})
 	sampleInterval, _ := time.ParseDuration(config.SampleInterval)
 	go func() {
